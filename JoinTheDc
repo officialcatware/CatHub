@@ -126,6 +126,74 @@ end
 
 -- ─── Game: Huss Valley ───────────────────────────────────────────────────────
 
+-- ─── Speed probe (shared diagnostic) ─────────────────────────────────────────
+
+-- Answers why a speed boost does nothing: does the game keep resetting WalkSpeed,
+-- or does it ignore WalkSpeed and drive your velocity itself?
+local PROBE_SPEED = 60
+local PROBE_SAMPLES = 8
+local PROBE_INTERVAL = 0.5
+local PROBE_EPSILON = 0.01
+local probeRunning = false
+
+local function averageSpeed(humanoid: Humanoid, root: BasePart, label: string): number
+	local total = 0
+	for i = 1, PROBE_SAMPLES do
+		local horizontal = (root.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude
+		total += horizontal
+		print(string.format("[probe] %s #%d  WalkSpeed=%.1f  actual=%.1f", label, i, humanoid.WalkSpeed, horizontal))
+		task.wait(PROBE_INTERVAL)
+	end
+	return total / PROBE_SAMPLES
+end
+
+-- beforeForce lets the caller pause its own speed logic; afterRestore lets it resume.
+local function runSpeedProbe(beforeForce: (speed: number) -> (), afterRestore: () -> ())
+	if probeRunning then
+		toast("Speed probe", "Already running.", gameIcon(game.GameId))
+		return
+	end
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not (character and humanoid and root) then
+		toast("Speed probe", "Your character isn't loaded.", gameIcon(game.GameId))
+		return
+	end
+
+	probeRunning = true
+	toast("Speed probe started", "Hold W for about 8 seconds.", gameIcon(game.GameId))
+
+	print("[probe] movers on character:")
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("Constraint") or descendant:IsA("BodyMover") then
+			print("   ", descendant:GetFullName(), descendant.ClassName)
+		end
+	end
+
+	local originalSpeed = humanoid.WalkSpeed
+	local normal = averageSpeed(humanoid, root, "normal")
+
+	beforeForce(PROBE_SPEED)
+	local resets = 0
+	local resetWatcher = humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+		if math.abs(humanoid.WalkSpeed - PROBE_SPEED) > PROBE_EPSILON then
+			resets += 1
+		end
+	end)
+	humanoid.WalkSpeed = PROBE_SPEED
+	print("[probe] forced WalkSpeed to", PROBE_SPEED)
+	local forced = averageSpeed(humanoid, root, "forced")
+	resetWatcher:Disconnect()
+
+	humanoid.WalkSpeed = originalSpeed
+	afterRestore()
+
+	print(string.format("[probe] average normal=%.1f forced=%.1f  resets by game=%d", normal, forced, resets))
+	toast("Speed probe done", string.format("normal %.1f → forced %.1f, %d resets", normal, forced, resets), gameIcon(game.GameId))
+	probeRunning = false
+end
+
 type GameScript = {
 	Name: string,
 	ScriptName: string,
@@ -431,66 +499,21 @@ local HussValley: GameScript = {
 			end,
 		}, "HV_SpeedMultiplier")
 
-		-- Diagnostic: does WalkSpeed actually move this character, or does the game drive velocity itself?
-		local PROBE_SPEED = 60
-		local PROBE_SAMPLES = 8
-		local PROBE_INTERVAL = 0.5
-		local probeRunning = false
-
-		local function averageSpeed(humanoid: Humanoid, root: BasePart, label: string): number
-			local total = 0
-			for i = 1, PROBE_SAMPLES do
-				local horizontal = (root.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude
-				total += horizontal
-				print(string.format("[probe] %s #%d  WalkSpeed=%.1f  actual=%.1f", label, i, humanoid.WalkSpeed, horizontal))
-				task.wait(PROBE_INTERVAL)
-			end
-			return total / PROBE_SAMPLES
-		end
-
-		local function runSpeedProbe()
-			local character = LocalPlayer.Character
-			local humanoid = getHumanoid()
-			local root = getRoot(character)
-			if not (character and humanoid and root) then
-				toast("Speed probe", "Your character isn't loaded.", gameIcon(game.GameId))
-				return
-			end
-
-			probeRunning = true
-			toast("Speed probe started", "Hold W for about 8 seconds.", gameIcon(game.GameId))
-
-			print("[probe] movers on character:")
-			for _, descendant in character:GetDescendants() do
-				if descendant:IsA("Constraint") or descendant:IsA("BodyMover") then
-					print("   ", descendant:GetFullName(), descendant.ClassName)
-				end
-			end
-
-			local normal = averageSpeed(humanoid, root, "normal")
-			-- Marked as our own write so the speed watcher doesn't adopt 60 as the new base.
-			lastAppliedSpeed = PROBE_SPEED
-			humanoid.WalkSpeed = PROBE_SPEED
-			print("[probe] forced WalkSpeed to", PROBE_SPEED)
-			local forced = averageSpeed(humanoid, root, "forced")
-			applySpeed(humanoid)
-
-			print(string.format("[probe] average normal=%.1f forced=%.1f", normal, forced))
-			toast("Speed probe done", string.format("normal %.1f → forced %.1f (console has details)", normal, forced), gameIcon(game.GameId))
-			probeRunning = false
-		end
-
 		RunnerTab:CreateSection("Diagnostics")
 
 		RunnerTab:CreateButton({
 			Name = "Run Speed Probe",
 			Description = "Hold W after clicking. Prints WalkSpeed vs. real speed to the console.",
 			Callback = function()
-				if probeRunning then
-					toast("Speed probe", "Already running.", gameIcon(game.GameId))
-					return
-				end
-				task.spawn(runSpeedProbe)
+				task.spawn(runSpeedProbe, function(speed)
+					-- Marked as our own write so the speed watcher doesn't adopt it as the new base.
+					lastAppliedSpeed = speed
+				end, function()
+					local humanoid = getHumanoid()
+					if humanoid and settings.SpeedEnabled then
+						applySpeed(humanoid)
+					end
+				end)
 			end,
 		})
 
@@ -561,13 +584,15 @@ local Town: GameScript = {
 			return character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
 		end
 
+		local probing = false
+
 		-- Movement: enforced every frame in case the game's own scripts reset it.
 		track(RunService.Heartbeat:Connect(function()
 			local humanoid = getHumanoid()
 			if not humanoid then
 				return
 			end
-			if settings.WalkSpeedEnabled then
+			if settings.WalkSpeedEnabled and not probing then
 				humanoid.WalkSpeed = settings.WalkSpeed
 			end
 			if settings.JumpPowerEnabled then
@@ -952,6 +977,18 @@ local Town: GameScript = {
 			end,
 		}, "TW_InfiniteJump")
 		bindToggle(PlayerTab, InfiniteJumpToggle, "Infinite Jump", "J", "TW_InfiniteJumpKey")
+
+		PlayerTab:CreateButton({
+			Name = "Run Speed Probe",
+			Description = "Hold W after clicking. Shows whether Town resets or ignores WalkSpeed.",
+			Callback = function()
+				task.spawn(runSpeedProbe, function()
+					probing = true
+				end, function()
+					probing = false
+				end)
+			end,
+		})
 
 		PlayerTab:CreateSection("Exploits")
 

@@ -567,6 +567,21 @@ local Town: GameScript = {
 			AuraBehind = 2,
 			IgnoreTeammates = true,
 			ClickTeleport = false,
+			Aimbot = false,
+			AimKey = "C",
+			AimWithRightMouse = true,
+			AimUseFov = true,
+			AimFov = 120,
+			AimSmoothing = 0.25,
+			AimPart = "Head",
+			AimWallCheck = true,
+			ShowFov = true,
+			SilentAim = false,
+			SilentUseFov = true,
+			SilentFov = 150,
+			SilentPart = "Head",
+			SilentWallCheck = true,
+			ShowSilentFov = true,
 		}
 
 		local connections: { RBXScriptConnection } = {}
@@ -909,6 +924,167 @@ local Town: GameScript = {
 			end
 		end))
 
+		-- Aimbot: while the aim key is held, eases the camera onto the enemy closest to the cursor.
+		-- Silent aim: leaves the camera alone and redirects the game's own shots at its target instead.
+		local AIMBOT_RENDER_STEP = "CatHubTownAimbot"
+		-- Gun rays are long; this keeps silent aim from bending the game's short utility raycasts.
+		local SILENT_MIN_RAY = 50
+		local COLOR_SILENT_FOV = Color3.fromRGB(0, 195, 255)
+
+		local fovGui = Instance.new("ScreenGui")
+		fovGui.Name = "CatHubTownFov"
+		fovGui.IgnoreGuiInset = true
+		fovGui.ResetOnSpawn = false
+
+		local function makeFovCircle(color: Color3): Frame
+			local circle = Instance.new("Frame")
+			circle.AnchorPoint = Vector2.new(0.5, 0.5)
+			circle.BackgroundTransparency = 1
+			circle.Visible = false
+
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(1, 0)
+			corner.Parent = circle
+
+			local stroke = Instance.new("UIStroke")
+			stroke.Color = color
+			stroke.Thickness = 1.5
+			stroke.Transparency = 0.3
+			stroke.Parent = circle
+
+			circle.Parent = fovGui
+			return circle
+		end
+
+		local aimFovCircle = makeFovCircle(COLOR_TEXT)
+		local silentFovCircle = makeFovCircle(COLOR_SILENT_FOV)
+		fovGui.Parent = gethui()
+
+		local function placeFovCircle(circle: Frame, visible: boolean, cursor: Vector2, radius: number)
+			circle.Visible = visible
+			circle.Position = UDim2.fromOffset(cursor.X, cursor.Y)
+			circle.Size = UDim2.fromOffset(radius * 2, radius * 2)
+		end
+
+		local function isVisible(camera: Camera, part: BasePart, targetCharacter: Model): boolean
+			local params = RaycastParams.new()
+			params.FilterType = Enum.RaycastFilterType.Exclude
+			params.FilterDescendantsInstances = { LocalPlayer.Character, camera }
+			local hit = Workspace:Raycast(camera.CFrame.Position, part.Position - camera.CFrame.Position, params)
+			return hit == nil or hit.Instance:IsDescendantOf(targetCharacter)
+		end
+
+		local function findTarget(camera: Camera, cursor: Vector2, partName: string, radius: number, wallCheck: boolean): BasePart?
+			local bestPart, bestDistance = nil, radius
+			for _, player in Players:GetPlayers() do
+				if player == LocalPlayer or isTeammate(player) then
+					continue
+				end
+				local character = player.Character
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				local part = character and character:FindFirstChild(partName) :: BasePart?
+				if not (humanoid and part) or humanoid.Health <= 0 then
+					continue
+				end
+				local screen, onScreen = camera:WorldToViewportPoint(part.Position)
+				if not onScreen then
+					continue
+				end
+				local distance = (Vector2.new(screen.X, screen.Y) - cursor).Magnitude
+				if distance < bestDistance and (not wallCheck or isVisible(camera, part, character)) then
+					bestPart, bestDistance = part, distance
+				end
+			end
+			return bestPart
+		end
+
+		local function aimHeld(): boolean
+			if settings.AimWithRightMouse and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+				return true
+			end
+			return UserInputService:IsKeyDown(Enum.KeyCode[settings.AimKey])
+		end
+
+		local silentTarget: BasePart? = nil
+
+		-- Runs after Roblox's camera scripts so they don't overwrite the aim each frame.
+		RunService:BindToRenderStep(AIMBOT_RENDER_STEP, Enum.RenderPriority.Camera.Value + 1, function()
+			local camera = Workspace.CurrentCamera
+			local cursor = UserInputService:GetMouseLocation()
+			local aimRadius = if settings.AimUseFov then settings.AimFov else math.huge
+			local silentRadius = if settings.SilentUseFov then settings.SilentFov else math.huge
+
+			placeFovCircle(aimFovCircle, settings.Aimbot and settings.AimUseFov and settings.ShowFov, cursor, settings.AimFov)
+			placeFovCircle(silentFovCircle, settings.SilentAim and settings.SilentUseFov and settings.ShowSilentFov, cursor, settings.SilentFov)
+
+			silentTarget = if settings.SilentAim
+				then findTarget(camera, cursor, settings.SilentPart, silentRadius, settings.SilentWallCheck)
+				else nil
+
+			if not settings.Aimbot or not aimHeld() then
+				return
+			end
+			local target = findTarget(camera, cursor, settings.AimPart, aimRadius, settings.AimWallCheck)
+			if not target then
+				return
+			end
+			local goal = CFrame.lookAt(camera.CFrame.Position, target.Position)
+			camera.CFrame = camera.CFrame:Lerp(goal, settings.AimSmoothing)
+		end)
+
+		-- Silent aim hooks go in on first use, so executors without hookmetamethod can still run everything else.
+		local mouse = LocalPlayer:GetMouse()
+		local originalIndex, originalNamecall
+		local silentHooked = false
+
+		local function holdingTool(): boolean
+			local character = LocalPlayer.Character
+			return character ~= nil and character:FindFirstChildOfClass("Tool") ~= nil
+		end
+
+		local function installSilentHooks()
+			if silentHooked then
+				return
+			end
+			assert(hookmetamethod and newcclosure and checkcaller and getnamecallmethod,
+				"CatHub: silent aim needs hookmetamethod, newcclosure, checkcaller and getnamecallmethod")
+
+			-- Guns that read the mouse (locally or by sending Mouse.Hit to the server) see the target instead.
+			originalIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
+				if silentTarget and not checkcaller() and self == mouse then
+					if key == "Hit" then
+						return CFrame.new(silentTarget.Position)
+					elseif key == "Target" then
+						return silentTarget
+					end
+				end
+				return originalIndex(self, key)
+			end))
+
+			-- Guns that raycast themselves get their long rays bent toward the target.
+			originalNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+				if silentTarget and not checkcaller() and self == Workspace and getnamecallmethod() == "Raycast" and holdingTool() then
+					local origin, direction, params = ...
+					if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" and direction.Magnitude >= SILENT_MIN_RAY then
+						local bent = (silentTarget.Position - origin).Unit * direction.Magnitude
+						return originalNamecall(self, origin, bent, params)
+					end
+				end
+				return originalNamecall(self, ...)
+			end))
+
+			silentHooked = true
+		end
+
+		local function removeSilentHooks()
+			if not silentHooked then
+				return
+			end
+			hookmetamethod(game, "__index", originalIndex)
+			hookmetamethod(game, "__namecall", originalNamecall)
+			silentHooked = false
+		end
+
 		local function bindToggle(tab, toggle, name: string, key: string, flag: string)
 			tab:CreateBind({
 				Name = name .. " Key",
@@ -1212,12 +1388,168 @@ local Town: GameScript = {
 			end,
 		}, "TW_IgnoreTeammates")
 
+		CombatTab:CreateSection("Aimbot")
+
+		local AimbotToggle = CombatTab:CreateToggle({
+			Name = "Aimbot",
+			Description = "Hold the aim key to lock onto the enemy nearest your cursor.",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.Aimbot = value
+			end,
+		}, "TW_Aimbot")
+		bindToggle(CombatTab, AimbotToggle, "Aimbot", "Z", "TW_AimbotKey")
+
+		CombatTab:CreateBind({
+			Name = "Aim Key (hold)",
+			CurrentBind = settings.AimKey,
+			HoldToInteract = true,
+			Callback = function() end,
+			OnChangedCallback = function(key)
+				settings.AimKey = tostring(key)
+			end,
+		}, "TW_AimKey")
+
+		CombatTab:CreateToggle({
+			Name = "Also Aim With Right Mouse",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.AimWithRightMouse = value
+			end,
+		}, "TW_AimWithRightMouse")
+
+		CombatTab:CreateToggle({
+			Name = "Use FOV",
+			Description = "Off locks onto anyone on screen, not just inside the circle.",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.AimUseFov = value
+			end,
+		}, "TW_AimUseFov")
+
+		CombatTab:CreateSlider({
+			Name = "FOV Radius (px)",
+			Range = { 20, 300 },
+			Increment = 5,
+			CurrentValue = settings.AimFov,
+			Callback = function(value)
+				settings.AimFov = value
+			end,
+		}, "TW_AimFov")
+
+		CombatTab:CreateSlider({
+			Name = "Smoothing (1 = snap)",
+			Range = { 0.05, 1 },
+			Increment = 0.05,
+			CurrentValue = settings.AimSmoothing,
+			Callback = function(value)
+				settings.AimSmoothing = value
+			end,
+		}, "TW_AimSmoothing")
+
+		CombatTab:CreateDropdown({
+			Name = "Aim Part",
+			Options = { "Head", "HumanoidRootPart" },
+			CurrentOption = { settings.AimPart },
+			MultipleOptions = false,
+			Callback = function(option)
+				settings.AimPart = option
+			end,
+		}, "TW_AimPart")
+
+		CombatTab:CreateToggle({
+			Name = "Wall Check",
+			Description = "Only aims at enemies you can actually see.",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.AimWallCheck = value
+			end,
+		}, "TW_AimWallCheck")
+
+		CombatTab:CreateToggle({
+			Name = "Show FOV Circle",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.ShowFov = value
+			end,
+		}, "TW_ShowFov")
+
+		CombatTab:CreateSection("Silent Aim")
+
+		local SilentAimToggle
+		SilentAimToggle = CombatTab:CreateToggle({
+			Name = "Silent Aim",
+			Description = "Camera stays free; your shots go to the enemy nearest your cursor.",
+			CurrentValue = false,
+			Callback = function(value)
+				if value then
+					local ok, err = pcall(installSilentHooks)
+					if not ok then
+						toast("Silent aim unavailable", tostring(err), gameIcon(game.GameId))
+						task.defer(SilentAimToggle.Set, SilentAimToggle, { CurrentValue = false })
+						return
+					end
+				end
+				settings.SilentAim = value
+			end,
+		}, "TW_SilentAim")
+		bindToggle(CombatTab, SilentAimToggle, "Silent Aim", "K", "TW_SilentAimKey")
+
+		CombatTab:CreateToggle({
+			Name = "Use FOV",
+			Description = "Off targets anyone on screen, not just inside the blue circle.",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.SilentUseFov = value
+			end,
+		}, "TW_SilentUseFov")
+
+		CombatTab:CreateSlider({
+			Name = "Silent FOV Radius (px)",
+			Range = { 20, 300 },
+			Increment = 5,
+			CurrentValue = settings.SilentFov,
+			Callback = function(value)
+				settings.SilentFov = value
+			end,
+		}, "TW_SilentFov")
+
+		CombatTab:CreateDropdown({
+			Name = "Silent Aim Part",
+			Options = { "Head", "HumanoidRootPart" },
+			CurrentOption = { settings.SilentPart },
+			MultipleOptions = false,
+			Callback = function(option)
+				settings.SilentPart = option
+			end,
+		}, "TW_SilentPart")
+
+		CombatTab:CreateToggle({
+			Name = "Silent Wall Check",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.SilentWallCheck = value
+			end,
+		}, "TW_SilentWallCheck")
+
+		CombatTab:CreateToggle({
+			Name = "Show Silent FOV Circle",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.ShowSilentFov = value
+			end,
+		}, "TW_ShowSilentFov")
+
 		return function()
 			running = false
 			for _, connection in connections do
 				connection:Disconnect()
 			end
 			Workspace.CurrentCamera.CameraSubject = getHumanoid()
+			RunService:UnbindFromRenderStep(AIMBOT_RENDER_STEP)
+			silentTarget = nil
+			removeSilentHooks()
+			fovGui:Destroy()
 			stopFly()
 			restoreCollision()
 			clearEsp()

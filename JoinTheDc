@@ -1,0 +1,508 @@
+-- CatHub — script hub (Roblox)
+-- Luau, client-side, run through an executor. Needs gethui(), HttpGet and loadstring.
+-- UI: Nebula-Softworks Luna Interface Suite (the library ImInsane-1337/Roblox-UI points to)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local Luna = loadstring(game:HttpGet("https://raw.githubusercontent.com/Nebula-Softworks/Luna-Interface-Suite/refs/heads/master/source.lua", true))()
+
+local HUB_NAME = "CatHub"
+local TOAST_SECONDS = 4
+local TOAST_WIDTH = 300
+local TWEEN_FAST = TweenInfo.new(0.25, Enum.EasingStyle.Quint)
+
+local COLOR_SURFACE = Color3.fromRGB(32, 30, 38)
+local COLOR_STROKE = Color3.fromRGB(64, 61, 76)
+local COLOR_TEXT = Color3.fromRGB(240, 240, 245)
+local COLOR_MUTED = Color3.fromRGB(165, 162, 180)
+
+local function gameIcon(gameId: number): string
+	return string.format("rbxthumb://type=GameIcon&id=%d&w=150&h=150", gameId)
+end
+
+-- ─── Toasts (top right) ──────────────────────────────────────────────────────
+
+local toastGui = Instance.new("ScreenGui")
+toastGui.Name = "CatHubToasts"
+toastGui.ResetOnSpawn = false
+toastGui.IgnoreGuiInset = true
+toastGui.DisplayOrder = 2147483647
+
+local toastList = Instance.new("Frame")
+toastList.AnchorPoint = Vector2.new(1, 0)
+toastList.Position = UDim2.new(1, -16, 0, 16)
+toastList.Size = UDim2.new(0, TOAST_WIDTH, 1, -32)
+toastList.BackgroundTransparency = 1
+toastList.Parent = toastGui
+
+local toastLayout = Instance.new("UIListLayout")
+toastLayout.Padding = UDim.new(0, 8)
+toastLayout.SortOrder = Enum.SortOrder.LayoutOrder
+toastLayout.Parent = toastList
+
+toastGui.Parent = gethui()
+
+local toastCount = 0
+
+local function toast(title: string, body: string, image: string)
+	-- The list layout owns the holder's position, so the card slides inside it.
+	local holder = Instance.new("Frame")
+	holder.Size = UDim2.new(1, 0, 0, 64)
+	holder.BackgroundTransparency = 1
+	toastCount += 1
+	holder.LayoutOrder = toastCount
+
+	local card = Instance.new("Frame")
+	card.Size = UDim2.fromScale(1, 1)
+	card.Position = UDim2.fromOffset(TOAST_WIDTH + 24, 0)
+	card.BackgroundColor3 = COLOR_SURFACE
+	card.BackgroundTransparency = 0.05
+	card.Parent = holder
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = card
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = COLOR_STROKE
+	stroke.Parent = card
+
+	local icon = Instance.new("ImageLabel")
+	icon.AnchorPoint = Vector2.new(0, 0.5)
+	icon.Position = UDim2.new(0, 8, 0.5, 0)
+	icon.Size = UDim2.fromOffset(48, 48)
+	icon.BackgroundTransparency = 1
+	icon.Image = image
+	icon.Parent = card
+
+	local iconCorner = Instance.new("UICorner")
+	iconCorner.CornerRadius = UDim.new(0, 6)
+	iconCorner.Parent = icon
+
+	local titleLabel = Instance.new("TextLabel")
+	titleLabel.Position = UDim2.fromOffset(66, 11)
+	titleLabel.Size = UDim2.new(1, -76, 0, 20)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Font = Enum.Font.GothamBold
+	titleLabel.TextSize = 15
+	titleLabel.TextColor3 = COLOR_TEXT
+	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+	titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	titleLabel.Text = title
+	titleLabel.Parent = card
+
+	local bodyLabel = Instance.new("TextLabel")
+	bodyLabel.Position = UDim2.fromOffset(66, 33)
+	bodyLabel.Size = UDim2.new(1, -76, 0, 18)
+	bodyLabel.BackgroundTransparency = 1
+	bodyLabel.Font = Enum.Font.Gotham
+	bodyLabel.TextSize = 13
+	bodyLabel.TextColor3 = COLOR_MUTED
+	bodyLabel.TextXAlignment = Enum.TextXAlignment.Left
+	bodyLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	bodyLabel.Text = body
+	bodyLabel.Parent = card
+
+	holder.Parent = toastList
+	TweenService:Create(card, TWEEN_FAST, { Position = UDim2.fromOffset(0, 0) }):Play()
+
+	task.delay(TOAST_SECONDS, function()
+		local out = TweenService:Create(card, TWEEN_FAST, { Position = UDim2.fromOffset(TOAST_WIDTH + 24, 0) })
+		out.Completed:Once(function()
+			holder:Destroy()
+		end)
+		out:Play()
+	end)
+end
+
+-- ─── Game: Huss Valley ───────────────────────────────────────────────────────
+
+type GameScript = {
+	Name: string,
+	ScriptName: string,
+	GameId: number,
+	Description: string,
+	Load: (Window: any) -> () -> (),
+}
+
+local HussValley: GameScript = {
+	Name = "Huss Valley",
+	ScriptName = "Huss Valley Script",
+	GameId = 10764627709,
+	Description = "Tag aura, chaser evade, speed boost. Click to load.",
+	Load = function(Window)
+		-- Downed runners keep no knife, so without this the aura would keep hitting the same body.
+		local RETAG_COOLDOWN = 6
+		local EVADE_MARGIN = 15
+		local DEFAULT_WALKSPEED = 16
+
+		local settings = {
+			KnifeName = "Knife",
+			AuraEnabled = false,
+			AuraDelay = 0.3,
+			BehindOffset = 2,
+			EvadeEnabled = false,
+			EvadeRadius = 18,
+			SpeedEnabled = false,
+			Speed = 28,
+		}
+
+		local running = true
+		local connections: { RBXScriptConnection } = {}
+		local lastTagged: { [Player]: number } = {}
+		local originalWalkSpeed = DEFAULT_WALKSPEED
+
+		local function getRoot(character: Model?): BasePart?
+			return character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+		end
+
+		local function getHumanoid(): Humanoid?
+			local character = LocalPlayer.Character
+			return character and character:FindFirstChildOfClass("Humanoid")
+		end
+
+		-- The chaser is whoever holds the knife, equipped or in the backpack.
+		local function findKnife(player: Player): Tool?
+			local character = player.Character
+			local inHand = character and character:FindFirstChild(settings.KnifeName)
+			if inHand and inHand:IsA("Tool") then
+				return inHand
+			end
+			local backpack = player:FindFirstChildOfClass("Backpack")
+			local stored = backpack and backpack:FindFirstChild(settings.KnifeName)
+			if stored and stored:IsA("Tool") then
+				return stored
+			end
+			return nil
+		end
+
+		local function isChaser(player: Player): boolean
+			return findKnife(player) ~= nil
+		end
+
+		local function isAlive(player: Player): boolean
+			local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+			return humanoid ~= nil and humanoid.Health > 0
+		end
+
+		local function recentlyTagged(player: Player): boolean
+			local taggedAt = lastTagged[player]
+			return taggedAt ~= nil and os.clock() - taggedAt < RETAG_COOLDOWN
+		end
+
+		local function nearestPlayer(origin: Vector3, wantChaser: boolean, maxDistance: number): (Player?, BasePart?)
+			local bestPlayer, bestRoot, bestDistance = nil, nil, maxDistance
+			for _, player in Players:GetPlayers() do
+				if player == LocalPlayer or not isAlive(player) or isChaser(player) ~= wantChaser then
+					continue
+				end
+				if not wantChaser and recentlyTagged(player) then
+					continue
+				end
+				local root = getRoot(player.Character)
+				if not root then
+					continue
+				end
+				local distance = (root.Position - origin).Magnitude
+				if distance < bestDistance then
+					bestPlayer, bestRoot, bestDistance = player, root, distance
+				end
+			end
+			return bestPlayer, bestRoot
+		end
+
+		-- Tag aura (chaser)
+		local function auraStep()
+			local character = LocalPlayer.Character
+			local humanoid = getHumanoid()
+			local myRoot = getRoot(character)
+			local knife = findKnife(LocalPlayer)
+			if not (character and humanoid and myRoot and knife) then
+				return
+			end
+
+			local target, targetRoot = nearestPlayer(myRoot.Position, false, math.huge)
+			if not (target and targetRoot) then
+				return
+			end
+
+			if knife.Parent ~= character then
+				humanoid:EquipTool(knife)
+			end
+
+			local behind = (targetRoot.CFrame * CFrame.new(0, 0, settings.BehindOffset)).Position
+			myRoot.CFrame = CFrame.lookAt(behind, targetRoot.Position)
+			knife:Activate()
+			lastTagged[target] = os.clock()
+		end
+
+		task.spawn(function()
+			while running do
+				if settings.AuraEnabled then
+					auraStep()
+				end
+				task.wait(settings.AuraDelay)
+			end
+		end)
+
+		-- Evade (runner): snaps you straight away from the closest chaser, flat on the ground plane.
+		table.insert(connections, RunService.Heartbeat:Connect(function()
+			if not settings.EvadeEnabled or isChaser(LocalPlayer) then
+				return
+			end
+			local myRoot = getRoot(LocalPlayer.Character)
+			if not myRoot then
+				return
+			end
+			local _, chaserRoot = nearestPlayer(myRoot.Position, true, settings.EvadeRadius)
+			if not chaserRoot then
+				return
+			end
+
+			local away = (myRoot.Position - chaserRoot.Position) * Vector3.new(1, 0, 1)
+			local direction = if away.Magnitude > 0 then away.Unit else myRoot.CFrame.LookVector
+			myRoot.CFrame += direction * (settings.EvadeRadius + EVADE_MARGIN - away.Magnitude)
+		end))
+
+		-- Speed boost: enforced every frame in case the game's own scripts reset it.
+		table.insert(connections, RunService.Heartbeat:Connect(function()
+			if not settings.SpeedEnabled then
+				return
+			end
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid.WalkSpeed = settings.Speed
+			end
+		end))
+
+		local function setSpeedEnabled(enabled: boolean)
+			local humanoid = getHumanoid()
+			if enabled and not settings.SpeedEnabled and humanoid then
+				originalWalkSpeed = humanoid.WalkSpeed
+			elseif not enabled and settings.SpeedEnabled and humanoid then
+				humanoid.WalkSpeed = originalWalkSpeed
+			end
+			settings.SpeedEnabled = enabled
+		end
+
+		table.insert(connections, Players.PlayerRemoving:Connect(function(player)
+			lastTagged[player] = nil
+		end))
+
+		-- UI
+		local ChaserTab = Window:CreateTab({ Name = "Chaser", Icon = "gps_fixed", ImageSource = "Material", ShowTitle = true })
+
+		local AuraToggle = ChaserTab:CreateToggle({
+			Name = "Tag Aura",
+			Description = "Teleports behind the nearest runner, swings, moves to the next.",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.AuraEnabled = value
+			end,
+		}, "HV_AuraEnabled")
+
+		ChaserTab:CreateBind({
+			Name = "Tag Aura Key",
+			CurrentBind = "G",
+			HoldToInteract = false,
+			Callback = function()
+				AuraToggle:Set({ CurrentValue = not AuraToggle.CurrentValue })
+			end,
+		}, "HV_AuraKey")
+
+		ChaserTab:CreateSlider({
+			Name = "Delay Between Tags (s)",
+			Range = { 0.1, 2 },
+			Increment = 0.05,
+			CurrentValue = settings.AuraDelay,
+			Callback = function(value)
+				settings.AuraDelay = value
+			end,
+		}, "HV_AuraDelay")
+
+		ChaserTab:CreateSlider({
+			Name = "Distance Behind Target",
+			Range = { 0, 6 },
+			Increment = 0.5,
+			CurrentValue = settings.BehindOffset,
+			Callback = function(value)
+				settings.BehindOffset = value
+			end,
+		}, "HV_BehindOffset")
+
+		ChaserTab:CreateInput({
+			Name = "Knife Tool Name",
+			Description = "Exact name of the chaser's knife Tool. Used to tell chasers from runners.",
+			PlaceholderText = "Knife",
+			CurrentValue = settings.KnifeName,
+			Numeric = false,
+			Enter = false,
+			Callback = function(text)
+				settings.KnifeName = text
+			end,
+		}, "HV_KnifeName")
+
+		local RunnerTab = Window:CreateTab({ Name = "Runner", Icon = "directions_run", ImageSource = "Material", ShowTitle = true })
+
+		RunnerTab:CreateToggle({
+			Name = "Evade Chasers",
+			Description = "Snaps you away whenever a chaser gets inside the radius.",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.EvadeEnabled = value
+			end,
+		}, "HV_EvadeEnabled")
+
+		RunnerTab:CreateSlider({
+			Name = "Evade Radius",
+			Range = { 6, 50 },
+			Increment = 1,
+			CurrentValue = settings.EvadeRadius,
+			Callback = function(value)
+				settings.EvadeRadius = value
+			end,
+		}, "HV_EvadeRadius")
+
+		RunnerTab:CreateSection("Speed Boost")
+
+		local SpeedToggle = RunnerTab:CreateToggle({
+			Name = "Speed Boost",
+			Description = "Works as runner or chaser.",
+			CurrentValue = false,
+			Callback = setSpeedEnabled,
+		}, "HV_SpeedEnabled")
+
+		RunnerTab:CreateBind({
+			Name = "Speed Boost Key",
+			CurrentBind = "H",
+			HoldToInteract = false,
+			Callback = function()
+				SpeedToggle:Set({ CurrentValue = not SpeedToggle.CurrentValue })
+			end,
+		}, "HV_SpeedKey")
+
+		RunnerTab:CreateSlider({
+			Name = "Speed",
+			Range = { 16, 100 },
+			Increment = 1,
+			CurrentValue = settings.Speed,
+			Callback = function(value)
+				settings.Speed = value
+			end,
+		}, "HV_Speed")
+
+		return function()
+			running = false
+			setSpeedEnabled(false)
+			for _, connection in connections do
+				connection:Disconnect()
+			end
+		end
+	end,
+}
+
+local GAMES: { GameScript } = { HussValley }
+
+-- ─── Hub UI ──────────────────────────────────────────────────────────────────
+
+local Window = Luna:CreateWindow({
+	Name = HUB_NAME,
+	Subtitle = "script hub",
+	LogoID = nil,
+	LoadingEnabled = true,
+	LoadingTitle = HUB_NAME,
+	LoadingSubtitle = "loading the litter",
+	ConfigSettings = {
+		RootFolder = HUB_NAME,
+		ConfigFolder = "Configs",
+	},
+	KeySystem = false,
+})
+
+local GamesTab = Window:CreateTab({ Name = "Games", Icon = "sports_esports", ImageSource = "Material", ShowTitle = true })
+GamesTab:CreateSection("Available")
+
+local loadedCleanups: { () -> () } = {}
+local loadedGames: { [GameScript]: true } = {}
+
+local function loadGame(entry: GameScript)
+	local icon = gameIcon(entry.GameId)
+	if loadedGames[entry] then
+		toast("Already loaded", entry.ScriptName .. " is already running.", icon)
+		return
+	end
+	if game.GameId ~= entry.GameId then
+		toast("Wrong game", "Join " .. entry.Name .. " to load this script.", icon)
+		return
+	end
+
+	table.insert(loadedCleanups, entry.Load(Window))
+	loadedGames[entry] = true
+	toast("Loaded " .. entry.ScriptName, "For " .. entry.Name, icon)
+end
+
+-- Luna buttons don't take an image, so the icon goes onto the button's own frame.
+local function attachIcon(buttonName: string, image: string)
+	local buttonFrame
+	for _, descendant in gethui():GetDescendants() do
+		if descendant.Name == buttonName and descendant:IsA("Frame") and descendant:FindFirstChild("Interact") then
+			buttonFrame = descendant
+			break
+		end
+	end
+	assert(buttonFrame, "CatHub: couldn't find the Luna button frame for " .. buttonName)
+
+	local icon = Instance.new("ImageLabel")
+	icon.AnchorPoint = Vector2.new(1, 0.5)
+	icon.Position = UDim2.new(1, -10, 0.5, 0)
+	icon.Size = UDim2.new(1, 0, 1, -12)
+	icon.BackgroundTransparency = 1
+	icon.Image = image
+
+	local aspect = Instance.new("UIAspectRatioConstraint")
+	aspect.AspectRatio = 1
+	aspect.DominantAxis = Enum.DominantAxis.Height
+	aspect.Parent = icon
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = icon
+
+	icon.Parent = buttonFrame
+end
+
+for _, entry in GAMES do
+	GamesTab:CreateButton({
+		Name = entry.Name,
+		Description = entry.Description,
+		Callback = function()
+			loadGame(entry)
+		end,
+	})
+	attachIcon(entry.Name, gameIcon(entry.GameId))
+end
+
+GamesTab:CreateDivider()
+GamesTab:CreateLabel({ Text = "More games coming soon.", Style = 2 })
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings", ImageSource = "Material", ShowTitle = true })
+
+SettingsTab:CreateButton({
+	Name = "Unload " .. HUB_NAME,
+	Callback = function()
+		for _, cleanup in loadedCleanups do
+			cleanup()
+		end
+		toastGui:Destroy()
+		Luna:Destroy()
+	end,
+})
+
+SettingsTab:BuildThemeSection()
+SettingsTab:BuildConfigSection()
+
+Luna:LoadAutoloadConfig()

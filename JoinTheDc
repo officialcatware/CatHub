@@ -5,12 +5,17 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
 local Luna = loadstring(game:HttpGet("https://raw.githubusercontent.com/Nebula-Softworks/Luna-Interface-Suite/refs/heads/master/source.lua", true))()
 
 local HUB_NAME = "CatHub"
+-- Code only: Luna builds the discord.gg link itself.
+local DISCORD_INVITE = "uMY32SKFE6"
 local TOAST_SECONDS = 4
 local TOAST_WIDTH = 300
 local TWEEN_FAST = TweenInfo.new(0.25, Enum.EasingStyle.Quint)
@@ -138,7 +143,8 @@ local HussValley: GameScript = {
 		-- Downed runners keep no knife, so without this the aura would keep hitting the same body.
 		local RETAG_COOLDOWN = 6
 		local EVADE_MARGIN = 15
-		local DEFAULT_WALKSPEED = 16
+		-- WalkSpeed is stored as float32, so reading back our own write needs a tolerance.
+		local SPEED_EPSILON = 0.01
 
 		local settings = {
 			KnifeName = "Knife",
@@ -148,13 +154,12 @@ local HussValley: GameScript = {
 			EvadeEnabled = false,
 			EvadeRadius = 18,
 			SpeedEnabled = false,
-			Speed = 28,
+			SpeedMultiplier = 1.5,
 		}
 
 		local running = true
 		local connections: { RBXScriptConnection } = {}
 		local lastTagged: { [Player]: number } = {}
-		local originalWalkSpeed = DEFAULT_WALKSPEED
 
 		local function getRoot(character: Model?): BasePart?
 			return character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
@@ -268,26 +273,53 @@ local HussValley: GameScript = {
 			myRoot.CFrame += direction * (settings.EvadeRadius + EVADE_MARGIN - away.Magnitude)
 		end))
 
-		-- Speed boost: enforced every frame in case the game's own scripts reset it.
-		table.insert(connections, RunService.Heartbeat:Connect(function()
-			if not settings.SpeedEnabled then
-				return
+		-- Speed boost multiplies whatever WalkSpeed the game sets, so ability speed changes stack with it.
+		local baseWalkSpeed = 0
+		local lastAppliedSpeed = -1
+		local speedWatcher: RBXScriptConnection?
+
+		local function applySpeed(humanoid: Humanoid)
+			local multiplier = if settings.SpeedEnabled then settings.SpeedMultiplier else 1
+			lastAppliedSpeed = baseWalkSpeed * multiplier
+			humanoid.WalkSpeed = lastAppliedSpeed
+		end
+
+		local function watchHumanoid(character: Model)
+			if speedWatcher then
+				speedWatcher:Disconnect()
 			end
-			local humanoid = getHumanoid()
-			if humanoid then
-				humanoid.WalkSpeed = settings.Speed
+			local humanoid = character:WaitForChild("Humanoid") :: Humanoid
+			baseWalkSpeed = humanoid.WalkSpeed
+			lastAppliedSpeed = -1
+
+			-- Compared by value, not a flag, because deferred signals fire after our write returns.
+			speedWatcher = humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+				if math.abs(humanoid.WalkSpeed - lastAppliedSpeed) < SPEED_EPSILON then
+					return
+				end
+				baseWalkSpeed = humanoid.WalkSpeed
+				if settings.SpeedEnabled then
+					applySpeed(humanoid)
+				end
+			end)
+
+			if settings.SpeedEnabled then
+				applySpeed(humanoid)
 			end
-		end))
+		end
 
 		local function setSpeedEnabled(enabled: boolean)
-			local humanoid = getHumanoid()
-			if enabled and not settings.SpeedEnabled and humanoid then
-				originalWalkSpeed = humanoid.WalkSpeed
-			elseif not enabled and settings.SpeedEnabled and humanoid then
-				humanoid.WalkSpeed = originalWalkSpeed
-			end
 			settings.SpeedEnabled = enabled
+			local humanoid = getHumanoid()
+			if humanoid and baseWalkSpeed > 0 then
+				applySpeed(humanoid)
+			end
 		end
+
+		if LocalPlayer.Character then
+			task.spawn(watchHumanoid, LocalPlayer.Character)
+		end
+		table.insert(connections, LocalPlayer.CharacterAdded:Connect(watchHumanoid))
 
 		table.insert(connections, Players.PlayerRemoving:Connect(function(player)
 			lastTagged[player] = nil
@@ -371,7 +403,7 @@ local HussValley: GameScript = {
 
 		local SpeedToggle = RunnerTab:CreateToggle({
 			Name = "Speed Boost",
-			Description = "Works as runner or chaser.",
+			Description = "Multiplies the game's own WalkSpeed.",
 			CurrentValue = false,
 			Callback = setSpeedEnabled,
 		}, "HV_SpeedEnabled")
@@ -386,18 +418,88 @@ local HussValley: GameScript = {
 		}, "HV_SpeedKey")
 
 		RunnerTab:CreateSlider({
-			Name = "Speed",
-			Range = { 16, 100 },
-			Increment = 1,
-			CurrentValue = settings.Speed,
+			Name = "Speed Multiplier",
+			Range = { 1, 4 },
+			Increment = 0.1,
+			CurrentValue = settings.SpeedMultiplier,
 			Callback = function(value)
-				settings.Speed = value
+				settings.SpeedMultiplier = value
+				local humanoid = getHumanoid()
+				if humanoid and settings.SpeedEnabled then
+					applySpeed(humanoid)
+				end
 			end,
-		}, "HV_Speed")
+		}, "HV_SpeedMultiplier")
+
+		-- Diagnostic: does WalkSpeed actually move this character, or does the game drive velocity itself?
+		local PROBE_SPEED = 60
+		local PROBE_SAMPLES = 8
+		local PROBE_INTERVAL = 0.5
+		local probeRunning = false
+
+		local function averageSpeed(humanoid: Humanoid, root: BasePart, label: string): number
+			local total = 0
+			for i = 1, PROBE_SAMPLES do
+				local horizontal = (root.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude
+				total += horizontal
+				print(string.format("[probe] %s #%d  WalkSpeed=%.1f  actual=%.1f", label, i, humanoid.WalkSpeed, horizontal))
+				task.wait(PROBE_INTERVAL)
+			end
+			return total / PROBE_SAMPLES
+		end
+
+		local function runSpeedProbe()
+			local character = LocalPlayer.Character
+			local humanoid = getHumanoid()
+			local root = getRoot(character)
+			if not (character and humanoid and root) then
+				toast("Speed probe", "Your character isn't loaded.", gameIcon(game.GameId))
+				return
+			end
+
+			probeRunning = true
+			toast("Speed probe started", "Hold W for about 8 seconds.", gameIcon(game.GameId))
+
+			print("[probe] movers on character:")
+			for _, descendant in character:GetDescendants() do
+				if descendant:IsA("Constraint") or descendant:IsA("BodyMover") then
+					print("   ", descendant:GetFullName(), descendant.ClassName)
+				end
+			end
+
+			local normal = averageSpeed(humanoid, root, "normal")
+			-- Marked as our own write so the speed watcher doesn't adopt 60 as the new base.
+			lastAppliedSpeed = PROBE_SPEED
+			humanoid.WalkSpeed = PROBE_SPEED
+			print("[probe] forced WalkSpeed to", PROBE_SPEED)
+			local forced = averageSpeed(humanoid, root, "forced")
+			applySpeed(humanoid)
+
+			print(string.format("[probe] average normal=%.1f forced=%.1f", normal, forced))
+			toast("Speed probe done", string.format("normal %.1f → forced %.1f (console has details)", normal, forced), gameIcon(game.GameId))
+			probeRunning = false
+		end
+
+		RunnerTab:CreateSection("Diagnostics")
+
+		RunnerTab:CreateButton({
+			Name = "Run Speed Probe",
+			Description = "Hold W after clicking. Prints WalkSpeed vs. real speed to the console.",
+			Callback = function()
+				if probeRunning then
+					toast("Speed probe", "Already running.", gameIcon(game.GameId))
+					return
+				end
+				task.spawn(runSpeedProbe)
+			end,
+		})
 
 		return function()
 			running = false
 			setSpeedEnabled(false)
+			if speedWatcher then
+				speedWatcher:Disconnect()
+			end
 			for _, connection in connections do
 				connection:Disconnect()
 			end
@@ -405,7 +507,516 @@ local HussValley: GameScript = {
 	end,
 }
 
-local GAMES: { GameScript } = { HussValley }
+-- ─── Game: Town ──────────────────────────────────────────────────────────────
+
+local Town: GameScript = {
+	Name = "Town",
+	ScriptName = "Town Script",
+	GameId = 1718755273,
+	Description = "Speed, fly, noclip, ESP, fullbright, teleport. Click to load.",
+	Load = function(Window)
+		local DEFAULT_WALKSPEED = 16
+		local DEFAULT_JUMPPOWER = 50
+		local DEFAULT_FOV = 70
+		local TELEPORT_OFFSET = CFrame.new(0, 0, 3)
+		local ESP_LABEL_OFFSET = Vector3.new(0, 3, 0)
+
+		local settings = {
+			WalkSpeedEnabled = false,
+			WalkSpeed = 32,
+			JumpPowerEnabled = false,
+			JumpPower = 75,
+			InfiniteJump = false,
+			FlySpeed = 60,
+			Noclip = false,
+			ESPEnabled = false,
+			ESPColor = Color3.fromRGB(0, 195, 255),
+			ESPHighlight = true,
+			ESPNames = true,
+			Fullbright = false,
+			FieldOfView = DEFAULT_FOV,
+			TeleportTarget = nil :: string?,
+		}
+
+		local connections: { RBXScriptConnection } = {}
+		local function track(connection: RBXScriptConnection)
+			table.insert(connections, connection)
+		end
+
+		local function getHumanoid(): Humanoid?
+			local character = LocalPlayer.Character
+			return character and character:FindFirstChildOfClass("Humanoid")
+		end
+
+		local function getRoot(): BasePart?
+			local character = LocalPlayer.Character
+			return character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+		end
+
+		-- Movement: enforced every frame in case the game's own scripts reset it.
+		track(RunService.Heartbeat:Connect(function()
+			local humanoid = getHumanoid()
+			if not humanoid then
+				return
+			end
+			if settings.WalkSpeedEnabled then
+				humanoid.WalkSpeed = settings.WalkSpeed
+			end
+			if settings.JumpPowerEnabled then
+				humanoid.UseJumpPower = true
+				humanoid.JumpPower = settings.JumpPower
+			end
+		end))
+
+		track(UserInputService.JumpRequest:Connect(function()
+			if not settings.InfiniteJump then
+				return
+			end
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+			end
+		end))
+
+		-- Fly
+		local flyAttachment: Attachment?
+		local flyVelocity: LinearVelocity?
+		local FlyToggle
+
+		local function stopFly()
+			if flyVelocity then
+				flyVelocity:Destroy()
+				flyVelocity = nil
+			end
+			if flyAttachment then
+				flyAttachment:Destroy()
+				flyAttachment = nil
+			end
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid.PlatformStand = false
+			end
+		end
+
+		local function startFly()
+			local root = getRoot()
+			local humanoid = getHumanoid()
+			if not (root and humanoid) then
+				FlyToggle:Set({ CurrentValue = false })
+				return
+			end
+
+			local attachment = Instance.new("Attachment")
+			attachment.Parent = root
+
+			local velocity = Instance.new("LinearVelocity")
+			velocity.Attachment0 = attachment
+			velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+			velocity.MaxForce = math.huge
+			velocity.VectorVelocity = Vector3.zero
+			velocity.Parent = root
+
+			flyAttachment = attachment
+			flyVelocity = velocity
+			humanoid.PlatformStand = true
+		end
+
+		local function flyDirection(cameraCFrame: CFrame): Vector3
+			local direction = Vector3.zero
+			if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction += cameraCFrame.LookVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction -= cameraCFrame.LookVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction += cameraCFrame.RightVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction -= cameraCFrame.RightVector end
+			if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction += Vector3.yAxis end
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then direction -= Vector3.yAxis end
+			return if direction.Magnitude > 0 then direction.Unit else direction
+		end
+
+		track(RunService.Heartbeat:Connect(function()
+			local root = getRoot()
+			if not (flyVelocity and root) then
+				return
+			end
+			local cameraCFrame = Workspace.CurrentCamera.CFrame
+			flyVelocity.VectorVelocity = flyDirection(cameraCFrame) * settings.FlySpeed
+			root.CFrame = CFrame.new(root.Position) * cameraCFrame.Rotation
+		end))
+
+		-- Noclip: only parts that started collidable get restored, so accessories stay as they were.
+		local noclipParts: { [BasePart]: true } = {}
+
+		local function restoreCollision()
+			for part in noclipParts do
+				if part.Parent then
+					part.CanCollide = true
+				end
+			end
+			table.clear(noclipParts)
+		end
+
+		track(RunService.Stepped:Connect(function()
+			if not settings.Noclip then
+				return
+			end
+			local character = LocalPlayer.Character
+			if not character then
+				return
+			end
+			for _, part in character:GetDescendants() do
+				if part:IsA("BasePart") and part.CanCollide then
+					noclipParts[part] = true
+					part.CanCollide = false
+				end
+			end
+		end))
+
+		-- The old character's constraints die with it; drop fly so it re-arms cleanly.
+		track(LocalPlayer.CharacterAdded:Connect(function()
+			table.clear(noclipParts)
+			flyAttachment, flyVelocity = nil, nil
+			FlyToggle:Set({ CurrentValue = false })
+		end))
+
+		-- ESP
+		type EspEntry = { Highlight: Highlight, Billboard: BillboardGui, Label: TextLabel }
+
+		local espFolder = Instance.new("Folder")
+		espFolder.Name = "CatHubTownESP"
+		espFolder.Parent = gethui()
+
+		local espEntries: { [Player]: EspEntry } = {}
+
+		local function createEsp(player: Player): EspEntry
+			local highlight = Instance.new("Highlight")
+			highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			highlight.FillTransparency = 0.6
+			highlight.OutlineTransparency = 0
+			highlight.Parent = espFolder
+
+			local billboard = Instance.new("BillboardGui")
+			billboard.Size = UDim2.fromOffset(200, 40)
+			billboard.StudsOffset = ESP_LABEL_OFFSET
+			billboard.AlwaysOnTop = true
+
+			local label = Instance.new("TextLabel")
+			label.Size = UDim2.fromScale(1, 1)
+			label.BackgroundTransparency = 1
+			label.Font = Enum.Font.GothamBold
+			label.TextSize = 14
+			label.TextStrokeTransparency = 0.5
+			label.Parent = billboard
+			billboard.Parent = espFolder
+
+			local entry = { Highlight = highlight, Billboard = billboard, Label = label }
+			espEntries[player] = entry
+			return entry
+		end
+
+		local function removeEsp(player: Player)
+			local entry = espEntries[player]
+			if not entry then
+				return
+			end
+			entry.Highlight:Destroy()
+			entry.Billboard:Destroy()
+			espEntries[player] = nil
+		end
+
+		local function clearEsp()
+			for player in espEntries do
+				removeEsp(player)
+			end
+		end
+
+		track(RunService.RenderStepped:Connect(function()
+			if not settings.ESPEnabled then
+				return
+			end
+			local myRoot = getRoot()
+			for _, player in Players:GetPlayers() do
+				if player == LocalPlayer then
+					continue
+				end
+				local character = player.Character
+				local root = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+				if not root then
+					removeEsp(player)
+					continue
+				end
+
+				local entry = espEntries[player] or createEsp(player)
+				entry.Highlight.Adornee = character
+				entry.Highlight.FillColor = settings.ESPColor
+				entry.Highlight.OutlineColor = settings.ESPColor
+				entry.Highlight.Enabled = settings.ESPHighlight
+
+				local distance = if myRoot then math.floor((root.Position - myRoot.Position).Magnitude) else 0
+				entry.Billboard.Adornee = root
+				entry.Billboard.Enabled = settings.ESPNames
+				entry.Label.Text = string.format("%s [%d]", player.DisplayName, distance)
+				entry.Label.TextColor3 = settings.ESPColor
+			end
+		end))
+
+		track(Players.PlayerRemoving:Connect(removeEsp))
+
+		-- World: enforced every frame so a day/night cycle can't override it.
+		local savedLighting: { [string]: any }?
+
+		track(RunService.Heartbeat:Connect(function()
+			if settings.Fullbright then
+				Lighting.Brightness = 2
+				Lighting.ClockTime = 14
+				Lighting.FogEnd = 1e6
+				Lighting.GlobalShadows = false
+				Lighting.Ambient = Color3.new(1, 1, 1)
+				Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+			end
+			Workspace.CurrentCamera.FieldOfView = settings.FieldOfView
+		end))
+
+		local function restoreLighting()
+			if not savedLighting then
+				return
+			end
+			for property, value in savedLighting do
+				(Lighting :: any)[property] = value
+			end
+			savedLighting = nil
+		end
+
+		local function setFullbright(enabled: boolean)
+			if enabled and not savedLighting then
+				savedLighting = {
+					Brightness = Lighting.Brightness,
+					ClockTime = Lighting.ClockTime,
+					FogEnd = Lighting.FogEnd,
+					GlobalShadows = Lighting.GlobalShadows,
+					Ambient = Lighting.Ambient,
+					OutdoorAmbient = Lighting.OutdoorAmbient,
+				}
+			end
+			settings.Fullbright = enabled
+			if not enabled then
+				restoreLighting()
+			end
+		end
+
+		-- UI
+		local PlayerTab = Window:CreateTab({ Name = "Town Player", Icon = "person", ImageSource = "Material", ShowTitle = true })
+		PlayerTab:CreateSection("Movement")
+
+		PlayerTab:CreateToggle({
+			Name = "WalkSpeed",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.WalkSpeedEnabled = value
+				local humanoid = getHumanoid()
+				if humanoid and not value then
+					humanoid.WalkSpeed = DEFAULT_WALKSPEED
+				end
+			end,
+		}, "TW_WalkSpeedEnabled")
+
+		PlayerTab:CreateSlider({
+			Name = "Speed",
+			Range = { 16, 150 },
+			Increment = 1,
+			CurrentValue = settings.WalkSpeed,
+			Callback = function(value)
+				settings.WalkSpeed = value
+			end,
+		}, "TW_WalkSpeed")
+
+		PlayerTab:CreateToggle({
+			Name = "JumpPower",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.JumpPowerEnabled = value
+				local humanoid = getHumanoid()
+				if humanoid and not value then
+					humanoid.JumpPower = DEFAULT_JUMPPOWER
+				end
+			end,
+		}, "TW_JumpPowerEnabled")
+
+		PlayerTab:CreateSlider({
+			Name = "Power",
+			Range = { 50, 300 },
+			Increment = 1,
+			CurrentValue = settings.JumpPower,
+			Callback = function(value)
+				settings.JumpPower = value
+			end,
+		}, "TW_JumpPower")
+
+		PlayerTab:CreateToggle({
+			Name = "Infinite Jump",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.InfiniteJump = value
+			end,
+		}, "TW_InfiniteJump")
+
+		PlayerTab:CreateSection("Exploits")
+
+		FlyToggle = PlayerTab:CreateToggle({
+			Name = "Fly",
+			Description = "WASD, Space up, Ctrl down.",
+			CurrentValue = false,
+			Callback = function(value)
+				if value then
+					startFly()
+				else
+					stopFly()
+				end
+			end,
+		}, "TW_Fly")
+
+		PlayerTab:CreateBind({
+			Name = "Fly Key",
+			CurrentBind = "F",
+			HoldToInteract = false,
+			Callback = function()
+				FlyToggle:Set({ CurrentValue = not FlyToggle.CurrentValue })
+			end,
+		}, "TW_FlyKey")
+
+		PlayerTab:CreateSlider({
+			Name = "Fly Speed",
+			Range = { 10, 300 },
+			Increment = 1,
+			CurrentValue = settings.FlySpeed,
+			Callback = function(value)
+				settings.FlySpeed = value
+			end,
+		}, "TW_FlySpeed")
+
+		local NoclipToggle = PlayerTab:CreateToggle({
+			Name = "Noclip",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.Noclip = value
+				if not value then
+					restoreCollision()
+				end
+			end,
+		}, "TW_Noclip")
+
+		PlayerTab:CreateBind({
+			Name = "Noclip Key",
+			CurrentBind = "N",
+			HoldToInteract = false,
+			Callback = function()
+				NoclipToggle:Set({ CurrentValue = not NoclipToggle.CurrentValue })
+			end,
+		}, "TW_NoclipKey")
+
+		local VisualsTab = Window:CreateTab({ Name = "Town Visuals", Icon = "visibility", ImageSource = "Material", ShowTitle = true })
+		VisualsTab:CreateSection("ESP")
+
+		VisualsTab:CreateToggle({
+			Name = "ESP",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.ESPEnabled = value
+				if not value then
+					clearEsp()
+				end
+			end,
+		}, "TW_ESPEnabled")
+
+		VisualsTab:CreateColorPicker({
+			Name = "ESP Color",
+			Color = settings.ESPColor,
+			Flag = "TW_ESPColor",
+			Callback = function(value)
+				settings.ESPColor = value
+			end,
+		}, "TW_ESPColor")
+
+		VisualsTab:CreateToggle({
+			Name = "Highlight",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.ESPHighlight = value
+			end,
+		}, "TW_ESPHighlight")
+
+		VisualsTab:CreateToggle({
+			Name = "Names + Distance",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.ESPNames = value
+			end,
+		}, "TW_ESPNames")
+
+		VisualsTab:CreateSection("World")
+
+		VisualsTab:CreateToggle({
+			Name = "Fullbright",
+			CurrentValue = false,
+			Callback = setFullbright,
+		}, "TW_Fullbright")
+
+		VisualsTab:CreateSlider({
+			Name = "Field of View",
+			Range = { 30, 120 },
+			Increment = 1,
+			CurrentValue = DEFAULT_FOV,
+			Callback = function(value)
+				settings.FieldOfView = value
+			end,
+		}, "TW_FieldOfView")
+
+		local TeleportTab = Window:CreateTab({ Name = "Town Teleport", Icon = "place", ImageSource = "Material", ShowTitle = true })
+
+		TeleportTab:CreateDropdown({
+			Name = "Target",
+			Options = {},
+			CurrentOption = {},
+			MultipleOptions = false,
+			SpecialType = "Player",
+			Callback = function(option)
+				settings.TeleportTarget = option
+			end,
+		}, "TW_TeleportTarget")
+
+		TeleportTab:CreateButton({
+			Name = "Teleport to Target",
+			Callback = function()
+				local target = settings.TeleportTarget and Players:FindFirstChild(settings.TeleportTarget)
+				local targetRoot = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+				local root = getRoot()
+				if not (targetRoot and root) or target == LocalPlayer then
+					toast("Teleport", "Pick another player who's loaded in.", gameIcon(game.GameId))
+					return
+				end
+				root.CFrame = targetRoot.CFrame * TELEPORT_OFFSET
+			end,
+		})
+
+		return function()
+			for _, connection in connections do
+				connection:Disconnect()
+			end
+			stopFly()
+			restoreCollision()
+			clearEsp()
+			espFolder:Destroy()
+			restoreLighting()
+			Workspace.CurrentCamera.FieldOfView = DEFAULT_FOV
+
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid.WalkSpeed = DEFAULT_WALKSPEED
+				humanoid.JumpPower = DEFAULT_JUMPPOWER
+			end
+		end
+	end,
+}
+
+local GAMES: { GameScript } = { HussValley, Town }
 
 -- ─── Hub UI ──────────────────────────────────────────────────────────────────
 
@@ -422,6 +1033,34 @@ local Window = Luna:CreateWindow({
 	},
 	KeySystem = false,
 })
+
+-- Luna's home tab ships a Discord card with the logo. Clicking it copies the invite and,
+-- if the Discord desktop app is running, opens the invite there through its local RPC.
+Window:CreateHomeTab({
+	SupportedExecutors = {},
+	DiscordInvite = DISCORD_INVITE,
+	Icon = 2,
+})
+
+local function hookDiscordCard()
+	for _, descendant in gethui():GetDescendants() do
+		if descendant.Name == "detailsholder" then
+			local discordCard = descendant:FindFirstChild("dashboard") and descendant.dashboard:FindFirstChild("Discord")
+			if discordCard and discordCard:FindFirstChild("Interact") then
+				discordCard.Interact.MouseButton1Click:Connect(function()
+					toast(
+						"Discord invite copied",
+						"discord.gg/" .. DISCORD_INVITE,
+						string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", LocalPlayer.UserId)
+					)
+				end)
+				return
+			end
+		end
+	end
+	error("CatHub: couldn't find Luna's Discord card on the home tab")
+end
+hookDiscordCard()
 
 local GamesTab = Window:CreateTab({ Name = "Games", Icon = "sports_esports", ImageSource = "Material", ShowTitle = true })
 GamesTab:CreateSection("Available")

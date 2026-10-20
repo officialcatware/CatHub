@@ -520,6 +520,8 @@ local Town: GameScript = {
 		local DEFAULT_FOV = 70
 		local TELEPORT_OFFSET = CFrame.new(0, 0, 3)
 		local ESP_LABEL_OFFSET = Vector3.new(0, 3, 0)
+		local CLICK_TP_RANGE = 2000
+		local CLICK_TP_LIFT = Vector3.new(0, 3, 0)
 
 		local settings = {
 			WalkSpeedEnabled = false,
@@ -536,6 +538,12 @@ local Town: GameScript = {
 			Fullbright = false,
 			FieldOfView = DEFAULT_FOV,
 			TeleportTarget = nil :: string?,
+			KillAura = false,
+			AuraRange = 150,
+			AuraDelay = 0.2,
+			AuraBehind = 2,
+			IgnoreTeammates = true,
+			ClickTeleport = false,
 		}
 
 		local connections: { RBXScriptConnection } = {}
@@ -802,11 +810,96 @@ local Town: GameScript = {
 			end
 		end
 
+		-- Kill aura: swings whatever Tool you have equipped, so equip your weapon first.
+		local function isTeammate(player: Player): boolean
+			return settings.IgnoreTeammates and LocalPlayer.Team ~= nil and player.Team == LocalPlayer.Team
+		end
+
+		local function nearestEnemy(origin: Vector3): BasePart?
+			local bestRoot, bestDistance = nil, settings.AuraRange
+			for _, player in Players:GetPlayers() do
+				if player == LocalPlayer or isTeammate(player) then
+					continue
+				end
+				local character = player.Character
+				local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				local root = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+				if not (humanoid and root) or humanoid.Health <= 0 then
+					continue
+				end
+				local distance = (root.Position - origin).Magnitude
+				if distance < bestDistance then
+					bestRoot, bestDistance = root, distance
+				end
+			end
+			return bestRoot
+		end
+
+		local function auraStep()
+			local character = LocalPlayer.Character
+			local myRoot = getRoot()
+			local weapon = character and character:FindFirstChildOfClass("Tool")
+			if not (myRoot and weapon) then
+				return
+			end
+			local targetRoot = nearestEnemy(myRoot.Position)
+			if not targetRoot then
+				return
+			end
+			local behind = (targetRoot.CFrame * CFrame.new(0, 0, settings.AuraBehind)).Position
+			myRoot.CFrame = CFrame.lookAt(behind, targetRoot.Position)
+			weapon:Activate()
+		end
+
+		local running = true
+		task.spawn(function()
+			while running do
+				if settings.KillAura then
+					auraStep()
+				end
+				task.wait(settings.AuraDelay)
+			end
+		end)
+
+		-- Click teleport: Ctrl + left click moves you to whatever the mouse is pointing at.
+		track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+			if gameProcessed or not settings.ClickTeleport then
+				return
+			end
+			if input.UserInputType ~= Enum.UserInputType.MouseButton1 or not UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+				return
+			end
+			local root = getRoot()
+			if not root then
+				return
+			end
+			local mouse = UserInputService:GetMouseLocation()
+			local ray = Workspace.CurrentCamera:ViewportPointToRay(mouse.X, mouse.Y)
+			local params = RaycastParams.new()
+			params.FilterType = Enum.RaycastFilterType.Exclude
+			params.FilterDescendantsInstances = { LocalPlayer.Character }
+			local hit = Workspace:Raycast(ray.Origin, ray.Direction * CLICK_TP_RANGE, params)
+			if hit then
+				root.CFrame = CFrame.new(hit.Position + CLICK_TP_LIFT) * root.CFrame.Rotation
+			end
+		end))
+
+		local function bindToggle(tab, toggle, name: string, key: string, flag: string)
+			tab:CreateBind({
+				Name = name .. " Key",
+				CurrentBind = key,
+				HoldToInteract = false,
+				Callback = function()
+					toggle:Set({ CurrentValue = not toggle.CurrentValue })
+				end,
+			}, flag)
+		end
+
 		-- UI
 		local PlayerTab = Window:CreateTab({ Name = "Town Player", Icon = "person", ImageSource = "Material", ShowTitle = true })
 		PlayerTab:CreateSection("Movement")
 
-		PlayerTab:CreateToggle({
+		local WalkSpeedToggle = PlayerTab:CreateToggle({
 			Name = "WalkSpeed",
 			CurrentValue = false,
 			Callback = function(value)
@@ -817,6 +910,7 @@ local Town: GameScript = {
 				end
 			end,
 		}, "TW_WalkSpeedEnabled")
+		bindToggle(PlayerTab, WalkSpeedToggle, "WalkSpeed", "V", "TW_WalkSpeedKey")
 
 		PlayerTab:CreateSlider({
 			Name = "Speed",
@@ -850,13 +944,14 @@ local Town: GameScript = {
 			end,
 		}, "TW_JumpPower")
 
-		PlayerTab:CreateToggle({
+		local InfiniteJumpToggle = PlayerTab:CreateToggle({
 			Name = "Infinite Jump",
 			CurrentValue = false,
 			Callback = function(value)
 				settings.InfiniteJump = value
 			end,
 		}, "TW_InfiniteJump")
+		bindToggle(PlayerTab, InfiniteJumpToggle, "Infinite Jump", "J", "TW_InfiniteJumpKey")
 
 		PlayerTab:CreateSection("Exploits")
 
@@ -915,7 +1010,7 @@ local Town: GameScript = {
 		local VisualsTab = Window:CreateTab({ Name = "Town Visuals", Icon = "visibility", ImageSource = "Material", ShowTitle = true })
 		VisualsTab:CreateSection("ESP")
 
-		VisualsTab:CreateToggle({
+		local EspToggle = VisualsTab:CreateToggle({
 			Name = "ESP",
 			CurrentValue = false,
 			Callback = function(value)
@@ -925,6 +1020,7 @@ local Town: GameScript = {
 				end
 			end,
 		}, "TW_ESPEnabled")
+		bindToggle(VisualsTab, EspToggle, "ESP", "X", "TW_ESPKey")
 
 		VisualsTab:CreateColorPicker({
 			Name = "ESP Color",
@@ -953,11 +1049,12 @@ local Town: GameScript = {
 
 		VisualsTab:CreateSection("World")
 
-		VisualsTab:CreateToggle({
+		local FullbrightToggle = VisualsTab:CreateToggle({
 			Name = "Fullbright",
 			CurrentValue = false,
 			Callback = setFullbright,
 		}, "TW_Fullbright")
+		bindToggle(VisualsTab, FullbrightToggle, "Fullbright", "B", "TW_FullbrightKey")
 
 		VisualsTab:CreateSlider({
 			Name = "Field of View",
@@ -996,10 +1093,94 @@ local Town: GameScript = {
 			end,
 		})
 
+		TeleportTab:CreateButton({
+			Name = "Spectate Target",
+			Callback = function()
+				local target = settings.TeleportTarget and Players:FindFirstChild(settings.TeleportTarget)
+				local humanoid = target and target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+				if not humanoid or target == LocalPlayer then
+					toast("Spectate", "Pick another player who's loaded in.", gameIcon(game.GameId))
+					return
+				end
+				Workspace.CurrentCamera.CameraSubject = humanoid
+			end,
+		})
+
+		TeleportTab:CreateButton({
+			Name = "Stop Spectating",
+			Callback = function()
+				Workspace.CurrentCamera.CameraSubject = getHumanoid()
+			end,
+		})
+
+		TeleportTab:CreateSection("Click Teleport")
+
+		local ClickTeleportToggle = TeleportTab:CreateToggle({
+			Name = "Click Teleport",
+			Description = "Ctrl + left click teleports you to where the mouse points.",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.ClickTeleport = value
+			end,
+		}, "TW_ClickTeleport")
+		bindToggle(TeleportTab, ClickTeleportToggle, "Click Teleport", "T", "TW_ClickTeleportKey")
+
+		local CombatTab = Window:CreateTab({ Name = "Town Combat", Icon = "gps_fixed", ImageSource = "Material", ShowTitle = true })
+
+		local KillAuraToggle = CombatTab:CreateToggle({
+			Name = "Kill Aura",
+			Description = "Equip your weapon. Teleports behind the nearest enemy and swings until they're dead.",
+			CurrentValue = false,
+			Callback = function(value)
+				settings.KillAura = value
+			end,
+		}, "TW_KillAura")
+		bindToggle(CombatTab, KillAuraToggle, "Kill Aura", "G", "TW_KillAuraKey")
+
+		CombatTab:CreateSlider({
+			Name = "Range (studs)",
+			Range = { 10, 1000 },
+			Increment = 10,
+			CurrentValue = settings.AuraRange,
+			Callback = function(value)
+				settings.AuraRange = value
+			end,
+		}, "TW_AuraRange")
+
+		CombatTab:CreateSlider({
+			Name = "Delay Between Swings (s)",
+			Range = { 0.05, 1 },
+			Increment = 0.05,
+			CurrentValue = settings.AuraDelay,
+			Callback = function(value)
+				settings.AuraDelay = value
+			end,
+		}, "TW_AuraDelay")
+
+		CombatTab:CreateSlider({
+			Name = "Distance Behind Target",
+			Range = { 0, 6 },
+			Increment = 0.5,
+			CurrentValue = settings.AuraBehind,
+			Callback = function(value)
+				settings.AuraBehind = value
+			end,
+		}, "TW_AuraBehind")
+
+		CombatTab:CreateToggle({
+			Name = "Ignore Teammates",
+			CurrentValue = true,
+			Callback = function(value)
+				settings.IgnoreTeammates = value
+			end,
+		}, "TW_IgnoreTeammates")
+
 		return function()
+			running = false
 			for _, connection in connections do
 				connection:Disconnect()
 			end
+			Workspace.CurrentCamera.CameraSubject = getHumanoid()
 			stopFly()
 			restoreCollision()
 			clearEsp()
